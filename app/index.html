@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en" dir="ltr" class="lang-en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Find My Car — CarIndex</title>
+<meta name="description" content="Around EGP 2M for an SUV? One clear pick, 2–3 real alternatives, and the evidence behind them.">
+<meta name="ci-track-endpoint" content="">
+<meta name="robots" content="noindex, nofollow">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&family=Noto+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container bar">
+    <a class="logo" href="#" aria-label="CarIndex"><span class="wm-car">CAR</span><span class="wm-index">INDEX</span></a>
+    <nav class="main-nav" aria-label="Main"><a href="#" aria-current="page" id="nav-find">Find My Car</a></nav>
+    <button class="lang-btn" id="lang-btn" type="button">عربي</button>
+  </div>
+</header>
+
+<main id="main" class="container">
+  <div id="screen" class="screen" aria-live="polite"></div>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <p class="trust"></p>
+    <p class="method" id="method"></p>
+  </div>
+</footer>
+
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-backdrop" data-close></div>
+  <section class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheet-title" tabindex="-1">
+    <button class="icon-btn sheet-close" data-close aria-label="Close">×</button>
+    <div id="sheet-body"></div>
+  </section>
+</div>
+
+<script src="../data/view.js"></script>
+<script src="i18n.js"></script>
+<script src="track.js"></script>
+<script src="engine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
