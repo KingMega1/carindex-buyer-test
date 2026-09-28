@@ -7,7 +7,7 @@
       separately and are never returned as recommendations. A final guard drops anything ineligible. */
 (function (root) {
   'use strict';
-  const ENGINE_VERSION = 'E5-2026-09-27';
+  const ENGINE_VERSION = 'E6-2026-09-28';
   const STEP = 100000;
 
   /* ---------- model facts ---------- */
@@ -91,11 +91,11 @@
   }
   const blocker = (m, b, terr) => { const e = eligibility(m, b, terr); return e.status === 'eligible' ? null : e.reason; };
 
-  // how well one price matches the budget intention: full score for 90–100% of budget (70–100% for a
-  // "maximum"), a gentle slope below it (a car that saves ~20% no longer ties with one that uses the budget),
-  // a steeper one into the +10% stretch. No cliffs.
+  // how well one price matches the budget intention: full score for 90–100% of budget (target and maximum alike;
+  // CEO 2026-09-28, from the budget sweep), a gentle slope below it, a steeper one into the +10% stretch. No cliffs.
+  // Above-budget prices only matter where stretch is earned (see earnedStretch in recommend).
   function priceFit(p, terr) {
-    const B = terr.budget, lo = terr.mode === 'max' ? 0.7 * B : 0.9 * B;
+    const B = terr.budget, lo = 0.9 * B;
     if (p > terr.ceil) return -1;
     if (p > B) return 1 - (p - B) / B * 2;          // +10% stretch -> 0.8
     if (p >= lo) return 1;
@@ -105,8 +105,11 @@
     const tr = currentTrims(m).filter(t => ptOk(t, b, m) === true);
     const fit = tr.filter(t => t.min <= terr.ceil).sort((x, y) => x.min - y.min);
     // the version the budget points at: best price fit (ties: the better-equipped, i.e. dearer, one)
-    const pick = fit.slice().sort((x, y) => priceFit(y.min, terr) - priceFit(x.min, terr) || y.min - x.min)[0];
-    return { all: tr.sort((x, y) => x.min - y.min), fit, pick, entry: fit[0] };
+    // a model with versions within budget is shown with those only; above-budget versions stand only for models
+    // that have nothing within budget, and then only if that stretch is earned
+    const inB = fit.filter(t => t.min <= terr.budget), show = inB.length ? inB : fit;
+    const pick = show.slice().sort((x, y) => priceFit(y.min, terr) - priceFit(x.min, terr) || y.min - x.min)[0];
+    return { all: tr.sort((x, y) => x.min - y.min), fit: show, pick, entry: show[0] };
   }
 
   /* ---------- scoring ---------- */
@@ -183,10 +186,61 @@
       if (!rows.length || known.length / rows.length < COVERAGE) { dropped.push(k); rows.forEach(r => { delete r.parts[k]; }); continue; }
       used.push(k);
       const mean = known.reduce((a, r) => a + r.parts[k], 0) / known.length;
-      rows.forEach(r => { if (r.parts[k] == null) r.parts[k] = mean; });
+      rows.forEach(r => { if (r.parts[k] == null) { r.parts[k] = mean; (r.filled = r.filled || []).push(k); } });
     }
     rows.forEach(r => { let s = 0, w = 0; for (const [k, v] of Object.entries(r.parts)) { s += W[k] * v; w += W[k]; } r.total = w ? s / w : 0; });
     return { rows, used, dropped };
+  }
+
+  /* ---------- earned stretch (CEO 2026-09-28) ----------
+     A car priced above the stated budget stays only when its fit on what the buyer asked for (every factor except
+     budget) beats the best car within budget by more than TIE. A brief with no such factor cannot earn stretch.
+     Kept cars carry what the extra spend buys, for the explanation. */
+  const briefFit = parts => { const k = Object.keys(parts).filter(x => x !== 'budget'); if (!k.length) return null; const w = k.reduce((a, x) => a + W[x], 0); return k.reduce((a, x) => a + W[x] * parts[x], 0) / w; };
+  function earnedStretch(scored, B) {
+    const inB = scored.filter(x => x.F.price <= B);
+    let best = null;
+    for (const x of inB) { const f = briefFit(x.parts); if (f != null && (!best || f > best.f)) best = { x, f }; }
+    return scored.filter(x => {
+      if (x.F.price <= B) return true;
+      const f = briefFit(x.parts);
+      if (f == null || !best || f - best.f <= TIE) return false;
+      const buys = Object.keys(x.parts).filter(k => k !== 'budget' && x.parts[k] - best.x.parts[k] > 1e-6);
+      x.stretch = { over: x.F.price - B, gain: +(f - best.f).toFixed(4), vs: best.x.F.m.id, buys };
+      return true;
+    });
+  }
+
+  /* ---------- confidence (output only; never changes the ranking) ----------
+     Is the leader's lead robust to what we don't know? The leader must stay ahead by more than TIE when
+       (a) any single ranking factor is removed (the lead must not rest on one factor), and
+       (b) every mean-filled unknown is set against it: its own unknowns to the worst known value, rivals' to the best.
+     level: 'tie' (lead within TIE) | 'lean' (ahead, but fails a or b; `depends` says why) | 'clear' | 'only' (one candidate). */
+  function confidence(main, used) {
+    if (!main.length) return null;
+    if (main.length === 1) return { level: 'only', lead: null, depends: [], basis: [] };
+    const hero = main[0], lead = hero.total - main[1].total;
+    const tot = (parts, keys) => { let s = 0, w = 0; for (const k of keys) { s += W[k] * parts[k]; w += W[k]; } return w ? s / w : 0; };
+    const stillLeads = (rows, keys) => {
+      const h = tot(rows[0], keys); let best = -Infinity;
+      for (let i = 1; i < rows.length; i++) best = Math.max(best, tot(rows[i], keys));
+      return h - best > TIE;
+    };
+    // what the lead over the runner-up is made of (weighted difference per factor)
+    const sw = used.reduce((a, k) => a + W[k], 0);
+    const basis = used.map(k => ({ k, d: +((W[k] * (hero.parts[k] - main[1].parts[k])) / sw).toFixed(4) }))
+      .filter(x => Math.abs(x.d) > 1e-4).sort((a, b) => b.d - a.d);
+    if (lead <= TIE) return { level: 'tie', lead: +lead.toFixed(4), depends: [], basis, vs: main[1].F.m.id };
+    const parts = main.map(x => x.parts), depends = [];
+    if (used.length === 1) depends.push(used[0]);
+    else for (const k of used) if (!stillLeads(parts, used.filter(x => x !== k))) depends.push(k);
+    if (main.some(x => (x.filled || []).length)) {
+      const lo = {}, hi = {};
+      for (const k of used) { const kn = main.filter(x => !(x.filled || []).includes(k)).map(x => x.parts[k]); lo[k] = Math.min(...kn); hi[k] = Math.max(...kn); }
+      const worst = main.map((x, i) => { const p = { ...x.parts }; for (const k of x.filled || []) p[k] = i === 0 ? lo[k] : hi[k]; return p; });
+      if (!stillLeads(worst, used)) depends.push('unknown_data');
+    }
+    return { level: depends.length ? 'lean' : 'clear', lead: +lead.toFixed(4), depends, basis, vs: main[1].F.m.id };
   }
 
   /* ---------- main ---------- */
@@ -209,8 +263,16 @@
     const ref = refSize(b, byId);
     const ctx = { terr, ref, byId };
     const fit = rankFit(Fs, b, ctx);
+    // nothing within budget meets the requirements: above-budget cars are not recommendations, only "nearest"
+    const inBudget = fit.rows.filter(x => x.F.price <= terr.budget);
+    if (!inBudget.length && fit.rows.length) {
+      const above = fit.rows.slice().sort((x, y) => x.F.price - y.F.price || x.F.m.id.localeCompare(y.F.m.id)).slice(0, 3)
+        .map(x => ({ id: x.F.m.id, price: x.F.price, over: x.F.price - terr.budget }));
+      return { confidence: null, factors: fit.used, factorsDropped: fit.dropped, tier: 0, brief: b, terr, pool: 0, eligible: eligible.length, blocked, unknown,
+        ranked: [], poolIds: [], hero: null, alts: [], nearestAbove: above, nearest: nearest(all, b, terr), shortlist: verdict(b, byId, terr, [], ctx), aspiration: aspirations(b, byId, terr) };
+    }
     // order within a tie carries no meaning; it is only made deterministic (price, then name)
-    const scored = fit.rows.sort((x, y) => (Math.abs(y.total - x.total) > 1e-9 ? y.total - x.total : 0) || x.F.price - y.F.price || x.F.m.id.localeCompare(y.F.m.id));
+    const scored = earnedStretch(fit.rows, terr.budget).sort((x, y) => (Math.abs(y.total - x.total) > 1e-9 ? y.total - x.total : 0) || x.F.price - y.F.price || x.F.m.id.localeCompare(y.F.m.id));
     // main recommendations come from the budget territory; much cheaper cars go to the separate "spend less" slot
     let main = scored.filter(s => s.F.price >= terr.floor), value = scored.filter(s => s.F.price < terr.floor);
     let widened = false;
@@ -218,7 +280,7 @@
     // has the brief earned a winner? the top tier = everything within TIE of the best main candidate
     const best = main.length ? main[0].total : 0;
     const tier = main.filter(s => s.total >= best - TIE);
-    const out = { factors: fit.used, factorsDropped: fit.dropped, tier: tier.length, decided: tier.length <= 3, clear: tier.length === 1, brief: b, terr, pool: scored.length, eligible: eligible.length, widened, blocked, unknown, ranked: main.map(s => s.F.m.id), poolIds: scored.map(s => s.F.m.id) };
+    const out = { confidence: confidence(main, fit.used), factors: fit.used, factorsDropped: fit.dropped, tier: tier.length, decided: tier.length <= 3, clear: tier.length === 1, brief: b, terr, pool: scored.length, eligible: eligible.length, widened, blocked, unknown, ranked: main.map(s => s.F.m.id), poolIds: scored.map(s => s.F.m.id) };
     const sl = verdict(b, byId, terr, scored, ctx);
     const asp = aspirations(b, byId, terr);
     if (!main.length) return { ...out, hero: null, alts: [], nearest: nearest(all, b, terr), shortlist: sl, aspiration: asp };
@@ -230,7 +292,8 @@
     if (equal) {
       // no winner earned: show up to three equally good options that span the tied set
       const picks = span(tier, 3);
-      hero = picks[0]; alts = picks.slice(1).map(x => ({ ...x, role: 'equal' }));
+      // listed by price; all carry role 'equal' — none leads
+      hero = { ...picks[0], role: 'equal' }; alts = picks.slice(1).map(x => ({ ...x, role: 'equal' }));
     } else {
       hero = named.length ? named[0] : main[0];
       alts = pickAlts(main, hero, b, named);
@@ -302,7 +365,7 @@
   function pack(x, b, terr, ctx, hero) {
     const F = x.F, m = F.m;
     return {
-      id: m.id, role: x.role || 'hero', score: +x.total.toFixed(4), parts: x.parts,
+      id: m.id, role: x.role || 'hero', score: +x.total.toFixed(4), parts: x.parts, stretch: x.stretch || null,
       pick: F.v.pick, fit: F.v.fit, all: F.v.all, entry: F.entry, price: F.price,
       size: F.size, sizeKey: sizeKey(m), premium: F.premium, hp: F.hp, warranty: F.warranty, seven: F.seven,
       hybrid: F.hybrid, ev: F.ev, anyEv: F.anyEv, petrolOnly: F.petrolOnly,
@@ -338,7 +401,9 @@
       if (s) return { id, ok: true, score: s.total, rank: scored.indexOf(s) + 1, F: s.F, parts: s.parts };
       const e = eligibility(m, b, terr);
       const tr = m.u ? currentTrims(m) : [];
-      return { id, ok: false, why: e.status === 'unknown' ? 'unknown_' + e.reason : e.reason, entry: tr.length ? Math.min(...tr.map(t => t.min)) : null };
+      // eligible but not ranked = only above-budget versions whose extra spend is not earned
+      const why = e.status === 'unknown' ? 'unknown_' + e.reason : e.status === 'eligible' ? 'budget' : e.reason;
+      return { id, ok: false, why, entry: tr.length ? Math.min(...tr.map(t => t.min)) : null };
     });
     const ok = rows.filter(r => r.ok).sort((x, y) => y.score - x.score);
     const res = { rows: rows.map(r => ({ id: r.id, ok: r.ok, why: r.why, entry: r.entry, rank: r.rank })), winner: null, margin: null, diffs: [] };
